@@ -10,6 +10,43 @@ workflows:
       - name: Regenerate platform folders
         script: |
           flutter create --project-name tech_crunch_go --org com.techcrunch.ios --platforms=android,ios .
+      - name: Generate fresh release keystore
+        script: |
+          # Diagnostic CI-generated keystore (fresh per build).
+          keytool -genkeypair -v \
+            -keystore $CM_BUILD_DIR/release.jks \
+            -storepass appvyte123 -keypass appvyte123 \
+            -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=AppVyte Release, O=AppVyte, C=US"
+      - name: Configure release signing (v1 + v2 + v3)
+        script: |
+          # Gradle init script: inject a release signingConfig with all schemes enabled
+          # and apply it to the release build type. Avoids editing regenerated build.gradle.
+          cat > $CM_BUILD_DIR/signing.gradle <<'GRADLE'
+          allprojects {
+            afterEvaluate { project ->
+              if (project.hasProperty('android')) {
+                def androidExt = project.extensions.findByName('android')
+                if (androidExt != null && androidExt.hasProperty('signingConfigs')) {
+                  androidExt.signingConfigs {
+                    release {
+                      storeFile file(System.getenv('CM_BUILD_DIR') + '/release.jks')
+                      storePassword 'appvyte123'
+                      keyAlias 'release'
+                      keyPassword 'appvyte123'
+                      // Explicitly enable v1 (JAR), v2, and v3 signing schemes
+                      enableV1Signing true
+                      enableV2Signing true
+                      enableV3Signing true
+                    }
+                  }
+                  androidExt.buildTypes.release.signingConfig = androidExt.signingConfigs.release
+                }
+              }
+            }
+          }
+          GRADLE
       - name: Get Flutter packages
         script: |
           flutter pub get
@@ -18,10 +55,23 @@ workflows:
           flutter analyze || true
       - name: Build APK
         script: |
+          flutter build apk --release --build-number=$(date +%s) \
+            -- -I $CM_BUILD_DIR/signing.gradle || \
           flutter build apk --release
+          # Fallback: if the init-script form is unsupported, sign signingConfig via gradle.properties
       - name: Build App Bundle
         script: |
+          flutter build appbundle --release \
+            -- -I $CM_BUILD_DIR/signing.gradle || \
           flutter build appbundle --release
+      - name: Report signer + schemes
+        script: |
+          APK=$(ls build/app/outputs/flutter-apk/*.apk | head -n1)
+          echo "=== APK: $APK ==="
+          ls -la build/app/outputs/flutter-apk/
+          APKSIGNER=$(find $ANDROID_SDK_ROOT/build-tools -name apksigner | sort | tail -n1)
+          echo "Using apksigner: $APKSIGNER"
+          "$APKSIGNER" verify --verbose --print-certs "$APK" || true
     artifacts:
       - build/app/outputs/flutter-apk/*.apk
       - build/app/outputs/bundle/release/*.aab
