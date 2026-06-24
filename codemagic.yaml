@@ -1,0 +1,27 @@
+# Codemagic build pipeline for TechCrunch Go
+workflows:
+  android-build:
+    name: Android Build (APK + AAB)
+    max_build_duration: 60
+    instance_type: linux_x2
+    environment:
+      flutter: stable
+    scripts:
+      - name: Regenerate platform folders
+        script: |
+          flutter create --project-name tech_crunch_go --org com.techcrunch.ios --platforms=android,ios .
+      - name: Get Flutter packages
+        script: |
+          flutter pub get
+      - name: Analyze project
+        script: |
+          flutter analyze || true
+      - name: Build APK
+        script: |
+          flutter build apk --release
+      - name: Build App Bundle
+        script: |
+          flutter build appbundle --release
+    artifacts:
+      - build/app/outputs/flutter-apk/*.apk
+      - build/app/outputs/bundle/release/*.aab
