@@ -12,41 +12,69 @@ workflows:
           flutter create --project-name tech_crunch_go --org com.techcrunch.ios --platforms=android,ios .
       - name: Generate fresh release keystore
         script: |
-          # Diagnostic CI-generated keystore (fresh per build).
+          # Diagnostic CI-generated keystore (fresh per build), stored inside android/app.
           keytool -genkeypair -v \
-            -keystore $CM_BUILD_DIR/release.jks \
+            -keystore android/app/release.jks \
             -storepass appvyte123 -keypass appvyte123 \
             -alias release \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=AppVyte Release, O=AppVyte, C=US"
       - name: Configure release signing (v1 + v2 + v3)
         script: |
-          # Gradle init script: inject a release signingConfig with all schemes enabled
-          # and apply it to the release build type. Avoids editing regenerated build.gradle.
-          cat > $CM_BUILD_DIR/signing.gradle <<'GRADLE'
-          allprojects {
-            afterEvaluate { project ->
-              if (project.hasProperty('android')) {
-                def androidExt = project.extensions.findByName('android')
-                if (androidExt != null && androidExt.hasProperty('signingConfigs')) {
-                  androidExt.signingConfigs {
-                    release {
-                      storeFile file(System.getenv('CM_BUILD_DIR') + '/release.jks')
-                      storePassword 'appvyte123'
-                      keyAlias 'release'
-                      keyPassword 'appvyte123'
-                      // Explicitly enable v1 (JAR), v2, and v3 signing schemes
-                      enableV1Signing true
-                      enableV2Signing true
-                      enableV3Signing true
-                    }
-                  }
-                  androidExt.buildTypes.release.signingConfig = androidExt.signingConfigs.release
-                }
-              }
-            }
-          }
-          GRADLE
+          # key.properties consumed by the standard Flutter signing snippet below.
+          cat > android/key.properties <<'PROPS'
+          storePassword=appvyte123
+          keyPassword=appvyte123
+          keyAlias=release
+          storeFile=release.jks
+          PROPS
+          # Patch android/app/build.gradle (Groovy DSL produced by flutter create):
+          # load key.properties, add a release signingConfig with v1/v2/v3 enabled,
+          # and point buildTypes.release at it (replacing the debug fallback).
+          python3 - <<'PY'
+          import re, io
+          p = "android/app/build.gradle"
+          s = open(p).read()
+
+          # 1) Inject keystore loading before the android block.
+          loader = (
+            "def keystoreProperties = new Properties()\n"
+            "def keystorePropertiesFile = rootProject.file('key.properties')\n"
+            "if (keystorePropertiesFile.exists()) {\n"
+            "    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\n"
+            "}\n\n"
+          )
+          s = re.sub(r'(\nandroid\s*\{)', "\n" + loader + r"\1", s, count=1)
+
+          # 2) Add signingConfigs.release with all three schemes enabled, right after android block.
+          signing = (
+            "\n    signingConfigs {\n"
+            "        release {\n"
+            "            keyAlias keystoreProperties['keyAlias']\n"
+            "            keyPassword keystoreProperties['keyPassword']\n"
+            "            storeFile keystoreProperties['storeFile'] ? file(keystoreProperties['storeFile']) : null\n"
+            "            storePassword keystoreProperties['storePassword']\n"
+            "            enableV1Signing true\n"
+            "            enableV2Signing true\n"
+            "            enableV3Signing true\n"
+            "        }\n"
+            "    }\n"
+          )
+          s = re.sub(r'(\nandroid\s*\{)', r"\1" + signing, s, count=1)
+
+          # 3) Point the release build type at the release signingConfig.
+          if "buildTypes {" in s:
+              s = re.sub(
+                  r'release\s*\{\s*signingConfig\s+signingConfigs\.debug',
+                  "release {\n            signingConfig signingConfigs.release",
+                  s, count=1)
+              # Some templates use signingConfigs.debug on its own line.
+              s = s.replace("signingConfig signingConfigs.debug",
+                            "signingConfig signingConfigs.release")
+          open(p, "w").write(s)
+          print("---- patched build.gradle ----")
+          print(s)
+          PY
       - name: Get Flutter packages
         script: |
           flutter pub get
@@ -55,14 +83,9 @@ workflows:
           flutter analyze || true
       - name: Build APK
         script: |
-          flutter build apk --release --build-number=$(date +%s) \
-            -- -I $CM_BUILD_DIR/signing.gradle || \
           flutter build apk --release
-          # Fallback: if the init-script form is unsupported, sign signingConfig via gradle.properties
       - name: Build App Bundle
         script: |
-          flutter build appbundle --release \
-            -- -I $CM_BUILD_DIR/signing.gradle || \
           flutter build appbundle --release
       - name: Report signer + schemes
         script: |
